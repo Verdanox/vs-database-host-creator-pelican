@@ -53,16 +53,15 @@ install_mysql() {
     
     print_success "MySQL installed successfully"
     
-    print_warning "Running mysql_secure_installation..."
-    print_warning "Please use these answers:"
-    print_warning "Validate Password Component: N"
-    print_warning "Remove anonymous users: Y"
-    print_warning "Disallow root login remotely: N"
-    print_warning "Remove test database and access to it: Y"
-    print_warning "Reload privilege tables now: Y"
-    echo ""
+    print_warning "Securing MySQL installation..."
     
-    mysql_secure_installation
+    mysql -e "DELETE FROM mysql.user WHERE User='';"
+    mysql -e "DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');"
+    mysql -e "DROP DATABASE IF EXISTS test;"
+    mysql -e "DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';"
+    mysql -e "FLUSH PRIVILEGES;"
+    
+    print_success "MySQL secured successfully"
 }
 
 create_database_host() {
