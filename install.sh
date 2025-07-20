@@ -47,62 +47,28 @@ detect_os() {
 }
 
 install_mysql() {
-    print_status "Installing MySQL"
-    
+    print_status "Installing MySQL/MariaDB"
     export DEBIAN_FRONTEND=noninteractive
-    
     apt update
-    
     if [[ "$OS_ID" == "debian" ]]; then
-        apt install -y wget gnupg lsb-release ca-certificates
-        
-        if ! apt-cache show mysql-server >/dev/null 2>&1; then
-            print_status "Adding official MySQL APT repository for Debian"
-            
-            wget -q https://dev.mysql.com/get/mysql-apt-config_0.8.29-1_all.deb -O /tmp/mysql-apt-config.deb
-            
-            if [[ $? -eq 0 ]]; then
-                echo "mysql-apt-config mysql-apt-config/select-server select mysql-8.0" | debconf-set-selections
-                echo "mysql-apt-config mysql-apt-config/select-product select Ok" | debconf-set-selections
-                
-                dpkg -i /tmp/mysql-apt-config.deb
-                rm -f /tmp/mysql-apt-config.deb
-                
-                apt update
-                
-                if ! apt-cache show mysql-server >/dev/null 2>&1; then
-                    print_warning "MySQL repository added but packages still not found, trying MariaDB as fallback"
-                    apt install -y mariadb-server mariadb-client
-                else
-                    apt install -y mysql-server mysql-client
-                fi
-            else
-                print_warning "Failed to download MySQL APT config, installing MariaDB as fallback"
-                apt install -y mariadb-server mariadb-client
-            fi
-        else
-            print_status "MySQL packages already available, installing..."
-            apt install -y mysql-server mysql-client
-        fi
+        print_status "Debian detected, installing MariaDB as MySQL-compatible server"
+        apt install -y mariadb-server mariadb-client
     else
+        print_status "Ubuntu detected, installing MySQL Server"
         apt install -y mysql-server mysql-client
     fi
-    
     if [[ $? -eq 0 ]]; then
         print_success "MySQL/MariaDB installed successfully"
     else
         print_error "MySQL/MariaDB installation failed"
         exit 1
     fi
-    
     SERVICE_NAME="mysql"
     if systemctl list-units --full -all | grep -q "mariadb.service"; then
         SERVICE_NAME="mariadb"
     fi
-    
     systemctl start $SERVICE_NAME
     systemctl enable $SERVICE_NAME
-    
     print_status "Waiting for MySQL/MariaDB to be ready..."
     for i in {1..30}; do
         if systemctl is-active --quiet $SERVICE_NAME; then
@@ -111,7 +77,6 @@ install_mysql() {
         fi
         sleep 2
     done
-    
     print_error "MySQL/MariaDB service failed to start"
     exit 1
 }
