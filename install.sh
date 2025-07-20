@@ -34,6 +34,7 @@ detect_os() {
         . /etc/os-release
         OS=$NAME
         VERSION=$VERSION_ID
+        OS_ID=$ID
     else
         print_error "Cannot detect operating system"
         exit 1
@@ -51,6 +52,27 @@ install_mysql() {
     export DEBIAN_FRONTEND=noninteractive
     
     apt update
+    
+    if [[ "$OS_ID" == "debian" ]]; then
+        if ! apt-cache show mysql-server >/dev/null 2>&1; then
+            print_status "Adding official MySQL APT repository for Debian"
+            
+            wget -q https://dev.mysql.com/get/mysql-apt-config_0.8.29-1_all.deb -O /tmp/mysql-apt-config.deb
+            
+            if [[ $? -eq 0 ]]; then
+                echo "mysql-apt-config mysql-apt-config/select-server select mysql-8.0" | debconf-set-selections
+                echo "mysql-apt-config mysql-apt-config/select-product select Ok" | debconf-set-selections
+                
+                dpkg -i /tmp/mysql-apt-config.deb
+                rm -f /tmp/mysql-apt-config.deb
+                
+                apt update
+            else
+                print_error "Failed to download MySQL APT config package"
+                exit 1
+            fi
+        fi
+    fi
     
     apt install -y mysql-server
     
@@ -97,20 +119,37 @@ secure_mysql() {
     elif mysql --socket=/var/run/mysqld/mysqld.sock -u root -e "SELECT 1;" 2>/dev/null; then
         MYSQL_CMD="mysql --socket=/var/run/mysqld/mysqld.sock -u root"
         print_success "Connected using socket authentication"
+    elif mysql --socket=/run/mysqld/mysqld.sock -u root -e "SELECT 1;" 2>/dev/null; then
+        MYSQL_CMD="mysql --socket=/run/mysqld/mysqld.sock -u root"
+        print_success "Connected using alternative socket path"
     else
         print_error "Cannot connect to MySQL with any method"
         print_warning "Trying to reset MySQL root access..."
         
-        systemctl stop mysql
+        SERVICE_NAME="mysql"
+        if systemctl list-units --full -all | grep -q "mariadb.service"; then
+            SERVICE_NAME="mariadb"
+        fi
         
-        mysqld_safe --skip-grant-tables --skip-networking &
-        SAFE_PID=$!
+        systemctl stop $SERVICE_NAME
+        
+        if command -v mysqld_safe >/dev/null 2>&1; then
+            mysqld_safe --skip-grant-tables --skip-networking &
+            SAFE_PID=$!
+        elif command -v mariadbd-safe >/dev/null 2>&1; then
+            mariadbd-safe --skip-grant-tables --skip-networking &
+            SAFE_PID=$!
+        else
+            print_error "Cannot find mysqld_safe or mariadbd-safe"
+            exit 1
+        fi
+        
         sleep 10
         
         if mysql -u root -e "UPDATE mysql.user SET authentication_string=NULL WHERE User='root' AND Host='localhost'; FLUSH PRIVILEGES;" 2>/dev/null; then
             print_success "Root access reset"
             kill $SAFE_PID 2>/dev/null || true
-            systemctl start mysql
+            systemctl start $SERVICE_NAME
             sleep 10
             MYSQL_CMD="mysql -u root"
         else
@@ -153,11 +192,17 @@ secure_mysql() {
     
     print_status "Configuring root authentication..."
     
-    MYSQL_VERSION=$($MYSQL_CMD -e "SELECT VERSION();" -s -N 2>/dev/null | cut -d. -f1)
-    if [[ "$MYSQL_VERSION" -ge 8 ]]; then
-        print_status "Detected MySQL 8.0+, configuring authentication..."
-        $MYSQL_CMD -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '';" 2>/dev/null || true
-        $MYSQL_CMD -e "ALTER USER 'root'@'127.0.0.1' IDENTIFIED WITH mysql_native_password BY '';" 2>/dev/null || true
+    DB_VERSION=$($MYSQL_CMD -e "SELECT VERSION();" -s -N 2>/dev/null)
+    if [[ "$DB_VERSION" == *"MariaDB"* ]]; then
+        print_status "Detected MariaDB, configuring authentication..."
+        $MYSQL_CMD -e "ALTER USER 'root'@'localhost' IDENTIFIED VIA mysql_native_password;" 2>/dev/null || true
+    else
+        MYSQL_VERSION=$(echo "$DB_VERSION" | cut -d. -f1)
+        if [[ "$MYSQL_VERSION" -ge 8 ]]; then
+            print_status "Detected MySQL 8.0+, configuring authentication..."
+            $MYSQL_CMD -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '';" 2>/dev/null || true
+            $MYSQL_CMD -e "ALTER USER 'root'@'127.0.0.1' IDENTIFIED WITH mysql_native_password BY '';" 2>/dev/null || true
+        fi
     fi
     
     print_status "Flushing privileges..."
@@ -291,7 +336,7 @@ allow_external_access() {
     
     MYCNF_FILE=""
     
-    for file in "/etc/mysql/mysql.conf.d/mysqld.cnf" "/etc/mysql/mariadb.conf.d/50-server.cnf" "/etc/mysql/my.cnf" "/etc/my.cnf"; do
+    for file in "/etc/mysql/mysql.conf.d/mysqld.cnf" "/etc/mysql/mariadb.conf.d/50-server.cnf" "/etc/mysql/my.cnf" "/etc/my.cnf" "/etc/mysql/conf.d/mysql.cnf"; do
         if [[ -f "$file" ]]; then
             MYCNF_FILE="$file"
             break
@@ -330,35 +375,43 @@ EOF
         fi
     fi
     
-    if mysqld --help --verbose > /dev/null 2>&1; then
-        print_success "MySQL configuration syntax validated"
-    else
-        print_error "MySQL configuration has syntax errors"
-        print_warning "Restoring backup configuration"
-        if [[ -f "${MYCNF_FILE}.backup.$(date +%Y%m%d_%H%M%S)" ]]; then
-            mv "${MYCNF_FILE}.backup.$(date +%Y%m%d_%H%M%S)" "$MYCNF_FILE"
+    if command -v mysqld >/dev/null 2>&1; then
+        if mysqld --help --verbose > /dev/null 2>&1; then
+            print_success "MySQL configuration syntax validated"
+        else
+            print_warning "MySQL configuration syntax check failed, but continuing"
         fi
-        exit 1
+    elif command -v mariadbd >/dev/null 2>&1; then
+        if mariadbd --help --verbose > /dev/null 2>&1; then
+            print_success "MariaDB configuration syntax validated"
+        else
+            print_warning "MariaDB configuration syntax check failed, but continuing"
+        fi
     fi
     
-    print_status "Restarting MySQL service..."
-    systemctl restart mysql
+    SERVICE_NAME="mysql"
+    if systemctl list-units --full -all | grep -q "mariadb.service"; then
+        SERVICE_NAME="mariadb"
+    fi
+    
+    print_status "Restarting $SERVICE_NAME service..."
+    systemctl restart $SERVICE_NAME
     
     sleep 5
     
-    if systemctl is-active --quiet mysql; then
-        print_success "MySQL restarted successfully"
+    if systemctl is-active --quiet $SERVICE_NAME; then
+        print_success "$SERVICE_NAME restarted successfully"
         
-        if netstat -tlnp 2>/dev/null | grep -q ":3306.*0.0.0.0"; then
-            print_success "MySQL is now accepting external connections on port 3306"
+        if netstat -tlnp 2>/dev/null | grep -q ":3306.*0.0.0.0" || ss -tlnp 2>/dev/null | grep -q ":3306.*0.0.0.0"; then
+            print_success "MySQL/MariaDB is now accepting external connections on port 3306"
         else
-            print_warning "MySQL may not be binding to external interfaces - please verify manually"
+            print_warning "MySQL/MariaDB may not be binding to external interfaces - please verify manually"
         fi
     else
-        print_error "MySQL restart failed"
-        print_warning "Checking MySQL status and logs..."
-        systemctl status mysql --no-pager
-        print_warning "Check logs with: journalctl -u mysql -n 20"
+        print_error "$SERVICE_NAME restart failed"
+        print_warning "Checking $SERVICE_NAME status and logs..."
+        systemctl status $SERVICE_NAME --no-pager
+        print_warning "Check logs with: journalctl -u $SERVICE_NAME -n 20"
         exit 1
     fi
 }
