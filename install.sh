@@ -122,7 +122,7 @@ secure_mysql() {
     
     print_success "MySQL connection method established: $MYSQL_CMD"
     
-    print_status "Applying security configurations..."
+    print_status "Applying security configurations manually..."
     
     print_status "Removing anonymous users..."
     if $MYSQL_CMD -e "DELETE FROM mysql.user WHERE User='';" 2>/dev/null; then
@@ -188,32 +188,45 @@ create_database_host() {
         rm -f /tmp/mysql_cmd_pelican
     fi
     
-    while true; do
-        echo -n "Enter password for pelicanuser (minimum 8 characters): "
-        read -s DB_PASSWORD
+    DB_PASSWORD=""
+    
+    if [[ -t 0 ]] && [[ -t 1 ]]; then
+        while true; do
+            echo -n "Enter password for pelicanuser (minimum 8 characters): "
+            read -s DB_PASSWORD
+            echo ""
+            
+            if [[ -z "$DB_PASSWORD" ]]; then
+                print_error "Database password cannot be empty"
+                continue
+            fi
+            
+            if [[ ${#DB_PASSWORD} -lt 8 ]]; then
+                print_error "Password must be at least 8 characters long"
+                continue
+            fi
+            
+            echo -n "Confirm password: "
+            read -s DB_PASSWORD_CONFIRM
+            echo ""
+            
+            if [[ "$DB_PASSWORD" != "$DB_PASSWORD_CONFIRM" ]]; then
+                print_error "Passwords do not match"
+                continue
+            fi
+            
+            break
+        done
+    else
+        print_warning "Non-interactive mode detected - generating secure password..."
+        DB_PASSWORD=$(openssl rand -base64 16 | tr -d "=+/" | cut -c1-16)
+        print_success "Generated secure password for pelicanuser"
         echo ""
-        
-        if [[ -z "$DB_PASSWORD" ]]; then
-            print_error "Database password cannot be empty"
-            continue
-        fi
-        
-        if [[ ${#DB_PASSWORD} -lt 8 ]]; then
-            print_error "Password must be at least 8 characters long"
-            continue
-        fi
-        
-        echo -n "Confirm password: "
-        read -s DB_PASSWORD_CONFIRM
+        print_warning "⚠️  IMPORTANT: Save this password - you'll need it for Pelican!"
+        echo -e "${YELLOW}Generated Password: ${DB_PASSWORD}${NC}"
         echo ""
-        
-        if [[ "$DB_PASSWORD" != "$DB_PASSWORD_CONFIRM" ]]; then
-            print_error "Passwords do not match"
-            continue
-        fi
-        
-        break
-    done
+        sleep 5
+    fi
     
     print_status "Creating pelicanuser for localhost..."
     if $MYSQL_CMD -e "CREATE USER IF NOT EXISTS 'pelicanuser'@'localhost' IDENTIFIED BY '$DB_PASSWORD';" 2>/dev/null; then
@@ -269,6 +282,8 @@ create_database_host() {
         print_warning "Database user created but connection test failed"
         print_warning "This might be normal if external connections aren't configured yet"
     fi
+    
+    echo "$DB_PASSWORD" > /tmp/pelican_db_password
 }
 
 allow_external_access() {
@@ -379,12 +394,23 @@ display_completion() {
     echo ""
     print_success "Pelican Database Host installation completed successfully!"
     echo ""
+    
+    DB_PASSWORD=""
+    if [[ -f /tmp/pelican_db_password ]]; then
+        DB_PASSWORD=$(cat /tmp/pelican_db_password)
+        rm -f /tmp/pelican_db_password
+    fi
+    
     echo -e "${YELLOW}📋 Database Connection Details:${NC}"
     echo "┌─────────────────────────────────────────┐"
     echo "│ Username: pelicanuser                   │"
     echo "│ Host: 127.0.0.1 (or your server IP)    │"
     echo "│ Port: 3306                              │"
+    if [[ -n "$DB_PASSWORD" ]]; then
+    echo "│ Password: $DB_PASSWORD                    │"
+    else
     echo "│ Password: [the one you set]             │"
+    fi
     echo "└─────────────────────────────────────────┘"
     echo ""
     echo -e "${YELLOW}🚀 Next Steps:${NC}"
@@ -400,6 +426,10 @@ display_completion() {
     echo "• Make sure your network security allows port 3306"
     echo "• Consider using SSL for production environments"
     echo ""
+    if [[ -n "$DB_PASSWORD" ]]; then
+        echo -e "${RED}⚠️  SECURITY REMINDER: Save the password above securely!${NC}"
+        echo ""
+    fi
     echo -e "${GREEN}✨ Made by: Verdanox${NC}"
 }
 
@@ -417,19 +447,32 @@ main() {
     print_warning "Operating System: $OS $VERSION"
     echo ""
     
-    echo -e "${YELLOW}This script will:${NC}"
-    echo "• Install MySQL Server"
-    echo "• Secure the MySQL installation"
-    echo "• Create a database user 'pelicanuser'"
-    echo "• Configure MySQL for external connections"
-    echo "• Set up firewall rules"
-    echo ""
-    
-    read -p "Do you want to continue? (y/N): " -n 1 -r
-    echo ""
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        print_warning "Installation cancelled by user"
-        exit 0
+    if [[ -t 0 ]] && [[ -t 1 ]]; then
+        echo -e "${YELLOW}This script will:${NC}"
+        echo "• Install MySQL Server"
+        echo "• Secure the MySQL installation"
+        echo "• Create a database user 'pelicanuser'"
+        echo "• Configure MySQL for external connections"
+        echo "• Set up firewall rules"
+        echo ""
+        
+        read -p "Do you want to continue? (y/N): " -n 1 -r
+        echo ""
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            print_warning "Installation cancelled by user"
+            exit 0
+        fi
+    else
+        print_warning "Running in non-interactive mode (auto-proceeding)"
+        echo -e "${YELLOW}This script will:${NC}"
+        echo "• Install MySQL Server"
+        echo "• Secure the MySQL installation" 
+        echo "• Create a database user 'pelicanuser'"
+        echo "• Configure MySQL for external connections"
+        echo "• Set up firewall rules"
+        echo ""
+        print_status "Starting installation in 3 seconds..."
+        sleep 3
     fi
     
     install_mysql
