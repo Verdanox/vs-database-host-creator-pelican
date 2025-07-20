@@ -54,6 +54,8 @@ install_mysql() {
     apt update
     
     if [[ "$OS_ID" == "debian" ]]; then
+        apt install -y wget gnupg lsb-release ca-certificates
+        
         if ! apt-cache show mysql-server >/dev/null 2>&1; then
             print_status "Adding official MySQL APT repository for Debian"
             
@@ -67,35 +69,50 @@ install_mysql() {
                 rm -f /tmp/mysql-apt-config.deb
                 
                 apt update
+                
+                if ! apt-cache show mysql-server >/dev/null 2>&1; then
+                    print_warning "MySQL repository added but packages still not found, trying MariaDB as fallback"
+                    apt install -y mariadb-server mariadb-client
+                else
+                    apt install -y mysql-server mysql-client
+                fi
             else
-                print_error "Failed to download MySQL APT config package"
-                exit 1
+                print_warning "Failed to download MySQL APT config, installing MariaDB as fallback"
+                apt install -y mariadb-server mariadb-client
             fi
+        else
+            print_status "MySQL packages already available, installing..."
+            apt install -y mysql-server mysql-client
         fi
+    else
+        apt install -y mysql-server mysql-client
     fi
     
-    apt install -y mysql-server
-    
     if [[ $? -eq 0 ]]; then
-        print_success "MySQL installed successfully"
+        print_success "MySQL/MariaDB installed successfully"
     else
-        print_error "MySQL installation failed"
+        print_error "MySQL/MariaDB installation failed"
         exit 1
     fi
     
-    systemctl start mysql
-    systemctl enable mysql
+    SERVICE_NAME="mysql"
+    if systemctl list-units --full -all | grep -q "mariadb.service"; then
+        SERVICE_NAME="mariadb"
+    fi
     
-    print_status "Waiting for MySQL to be ready..."
+    systemctl start $SERVICE_NAME
+    systemctl enable $SERVICE_NAME
+    
+    print_status "Waiting for MySQL/MariaDB to be ready..."
     for i in {1..30}; do
-        if systemctl is-active --quiet mysql; then
-            print_success "MySQL service started and enabled"
+        if systemctl is-active --quiet $SERVICE_NAME; then
+            print_success "MySQL/MariaDB service started and enabled"
             return 0
         fi
         sleep 2
     done
     
-    print_error "MySQL service failed to start"
+    print_error "MySQL/MariaDB service failed to start"
     exit 1
 }
 
