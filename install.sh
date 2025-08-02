@@ -46,6 +46,19 @@ detect_os() {
     fi
 }
 
+install_dependencies() {
+    print_status "Installing required dependencies"
+    export DEBIAN_FRONTEND=noninteractive
+    apt update
+    apt install -y nginx php-fpm php-mysql php-mbstring php-zip php-gd php-json php-curl unzip wget curl net-tools
+    if [[ $? -eq 0 ]]; then
+        print_success "Dependencies installed successfully"
+    else
+        print_error "Failed to install dependencies"
+        exit 1
+    fi
+}
+
 install_mysql() {
     print_status "Installing MySQL/MariaDB"
     export DEBIAN_FRONTEND=noninteractive
@@ -311,6 +324,220 @@ create_database_host() {
     fi
     
     echo "$DB_PASSWORD" > /tmp/pelican_db_password
+    echo "$MYSQL_CMD" > /tmp/mysql_cmd_pelican
+}
+
+install_phpmyadmin() {
+    print_status "Installing phpMyAdmin"
+    
+    # Download and extract phpMyAdmin
+    cd /usr/share
+    print_status "Downloading phpMyAdmin..."
+    if wget https://www.phpmyadmin.net/downloads/phpMyAdmin-latest-all-languages.zip -O phpmyadmin.zip; then
+        print_success "phpMyAdmin downloaded successfully"
+    else
+        print_error "Failed to download phpMyAdmin"
+        exit 1
+    fi
+    
+    print_status "Extracting phpMyAdmin..."
+    if unzip -q phpmyadmin.zip; then
+        print_success "phpMyAdmin extracted successfully"
+    else
+        print_error "Failed to extract phpMyAdmin"
+        exit 1
+    fi
+    
+    rm phpmyadmin.zip
+    mv phpMyAdmin-*-all-languages phpmyadmin
+    chmod -R 0755 phpmyadmin
+    
+    # Create temp directory
+    mkdir -p /usr/share/phpmyadmin/tmp/
+    chown -R www-data:www-data /usr/share/phpmyadmin/tmp/
+    
+    print_success "phpMyAdmin files installed successfully"
+}
+
+configure_phpmyadmin_user() {
+    print_status "Setting up phpMyAdmin database user"
+    
+    MYSQL_CMD="mysql -u root"
+    if [[ -f /tmp/mysql_cmd_pelican ]]; then
+        MYSQL_CMD=$(cat /tmp/mysql_cmd_pelican)
+    fi
+    
+    PMA_PASSWORD=""
+    
+    if [[ -t 0 ]] && [[ -t 1 ]]; then
+        while true; do
+            echo -n "Enter password for phpMyAdmin user 'pma' (minimum 8 characters): "
+            read -s PMA_PASSWORD
+            echo ""
+            
+            if [[ -z "$PMA_PASSWORD" ]]; then
+                print_error "phpMyAdmin password cannot be empty"
+                continue
+            fi
+            
+            if [[ ${#PMA_PASSWORD} -lt 8 ]]; then
+                print_error "Password must be at least 8 characters long"
+                continue
+            fi
+            
+            echo -n "Confirm password: "
+            read -s PMA_PASSWORD_CONFIRM
+            echo ""
+            
+            if [[ "$PMA_PASSWORD" != "$PMA_PASSWORD_CONFIRM" ]]; then
+                print_error "Passwords do not match"
+                continue
+            fi
+            
+            break
+        done
+    else
+        print_warning "Non-interactive mode detected - generating secure password for phpMyAdmin..."
+        PMA_PASSWORD=$(openssl rand -base64 16 | tr -d "=+/" | cut -c1-16)
+        print_success "Generated secure password for pma user"
+        echo ""
+        print_warning "⚠️  IMPORTANT: Save this password for phpMyAdmin!"
+        echo -e "${YELLOW}phpMyAdmin Password: ${PMA_PASSWORD}${NC}"
+        echo ""
+        sleep 5
+    fi
+    
+    # Create phpMyAdmin user
+    print_status "Creating phpMyAdmin user 'pma'@'localhost'..."
+    if $MYSQL_CMD -e "CREATE USER IF NOT EXISTS 'pma'@'localhost' IDENTIFIED BY '$PMA_PASSWORD';" 2>/dev/null; then
+        print_success "User pma@localhost created"
+    else
+        print_warning "User pma@localhost may already exist"
+    fi
+    
+    if $MYSQL_CMD -e "GRANT ALL PRIVILEGES ON *.* TO 'pma'@'localhost' WITH GRANT OPTION;" 2>/dev/null; then
+        print_success "All privileges granted to pma@localhost"
+    else
+        print_error "Failed to grant privileges to pma@localhost"
+    fi
+    
+    if $MYSQL_CMD -e "FLUSH PRIVILEGES;" 2>/dev/null; then
+        print_success "Privileges flushed"
+    else
+        print_error "Failed to flush privileges"
+    fi
+    
+    echo "$PMA_PASSWORD" > /tmp/pma_password
+}
+
+setup_nginx_phpmyadmin() {
+    print_status "Configuring Nginx for phpMyAdmin"
+    
+    FQDN=""
+    USE_PORT=""
+    
+    if [[ -t 0 ]] && [[ -t 1 ]]; then
+        echo -n "Enter your FQDN (domain) or IP address: "
+        read FQDN
+    else
+        print_warning "Non-interactive mode: Using localhost as FQDN"
+        FQDN="localhost"
+    fi
+    
+    # Check if it's an IP address or domain
+    if [[ $FQDN =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        print_status "IP address detected: $FQDN"
+        # Check if port 80 is already in use
+        if netstat -tlnp 2>/dev/null | grep -q ":80 " || ss -tlnp 2>/dev/null | grep -q ":80 "; then
+            print_warning "Port 80 is already in use, using port 1024"
+            USE_PORT="1024"
+        else
+            USE_PORT="80"
+        fi
+    else
+        print_status "Domain detected: $FQDN"
+        USE_PORT="80"
+    fi
+    
+    # Get PHP version
+    PHP_VERSION=$(php -v | head -n1 | cut -d" " -f2 | cut -f1-2 -d".")
+    
+    # Create Nginx configuration
+    cat > /etc/nginx/sites-available/phpmyadmin.conf << EOF
+server {
+    listen $USE_PORT;
+    server_name $FQDN;
+    root /usr/share/phpmyadmin;
+    index index.php index.html index.htm;
+
+    access_log /var/log/nginx/phpmyadmin_access.log;
+    error_log /var/log/nginx/phpmyadmin_error.log;
+
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+
+    location ~ \.php$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/var/run/php/php$PHP_VERSION-fpm.sock;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        include fastcgi_params;
+    }
+
+    location ~ /\.ht {
+        deny all;
+    }
+
+    location = /favicon.ico {
+        log_not_found off;
+        access_log off;
+    }
+
+    location = /robots.txt {
+        log_not_found off;
+        access_log off;
+        allow all;
+    }
+
+    location ~* \.(css|gif|ico|jpeg|jpg|js|png)$ {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+}
+EOF
+    
+    print_success "Nginx configuration created"
+    
+    # Enable the site
+    if [[ -f /etc/nginx/sites-available/phpmyadmin.conf ]]; then
+        ln -sf /etc/nginx/sites-available/phpmyadmin.conf /etc/nginx/sites-enabled/
+        print_success "phpMyAdmin site enabled"
+    else
+        print_error "Failed to create Nginx configuration"
+        exit 1
+    fi
+    
+    # Test Nginx configuration
+    if nginx -t 2>/dev/null; then
+        print_success "Nginx configuration syntax is valid"
+    else
+        print_error "Nginx configuration syntax error"
+        nginx -t
+        exit 1
+    fi
+    
+    # Start and enable services
+    systemctl enable nginx php$PHP_VERSION-fpm
+    systemctl restart nginx php$PHP_VERSION-fpm
+    
+    if systemctl is-active --quiet nginx && systemctl is-active --quiet php$PHP_VERSION-fpm; then
+        print_success "Nginx and PHP-FPM services started successfully"
+    else
+        print_error "Failed to start web services"
+        exit 1
+    fi
+    
+    echo "$FQDN:$USE_PORT" > /tmp/phpmyadmin_url
 }
 
 allow_external_access() {
@@ -401,39 +628,68 @@ EOF
 setup_firewall() {
     print_status "Setting up firewall rules..."
     
+    PHPMYADMIN_PORT=""
+    if [[ -f /tmp/phpmyadmin_url ]]; then
+        PHPMYADMIN_URL=$(cat /tmp/phpmyadmin_url)
+        PHPMYADMIN_PORT=$(echo "$PHPMYADMIN_URL" | cut -d: -f2)
+    fi
+    
     if command -v ufw &> /dev/null; then
         if ufw status | grep -q "Status: active"; then
             ufw allow 3306/tcp
             print_success "UFW rule added for MySQL port 3306"
+            
+            if [[ -n "$PHPMYADMIN_PORT" ]]; then
+                ufw allow $PHPMYADMIN_PORT/tcp
+                print_success "UFW rule added for phpMyAdmin port $PHPMYADMIN_PORT"
+            fi
         else
             print_warning "UFW is installed but not active"
-            print_warning "To enable UFW and allow MySQL: ufw enable && ufw allow 3306/tcp"
+            print_warning "To enable UFW and allow ports: ufw enable && ufw allow 3306/tcp"
+            if [[ -n "$PHPMYADMIN_PORT" ]]; then
+                print_warning "Also allow phpMyAdmin port: ufw allow $PHPMYADMIN_PORT/tcp"
+            fi
         fi
     elif command -v firewall-cmd &> /dev/null; then
         if systemctl is-active --quiet firewalld; then
             firewall-cmd --permanent --add-port=3306/tcp
+            if [[ -n "$PHPMYADMIN_PORT" ]]; then
+                firewall-cmd --permanent --add-port=$PHPMYADMIN_PORT/tcp
+            fi
             firewall-cmd --reload
-            print_success "Firewalld rule added for MySQL port 3306"
+            print_success "Firewalld rules added for MySQL and phpMyAdmin"
         else
             print_warning "Firewalld is installed but not active"
         fi
     else
         print_warning "No supported firewall detected (UFW/firewalld)"
-        print_warning "Please manually ensure port 3306 is accessible"
-        print_warning "Example for iptables: iptables -A INPUT -p tcp --dport 3306 -j ACCEPT"
+        print_warning "Please manually ensure ports 3306 and $PHPMYADMIN_PORT are accessible"
     fi
 }
 
 display_completion() {
     print_status "Installation Complete!"
     echo ""
-    print_success "Pelican Database Host installation completed successfully!"
+    print_success "Pelican Database Host with phpMyAdmin installation completed successfully!"
     echo ""
     
     DB_PASSWORD=""
+    PMA_PASSWORD=""
+    PHPMYADMIN_URL=""
+    
     if [[ -f /tmp/pelican_db_password ]]; then
         DB_PASSWORD=$(cat /tmp/pelican_db_password)
         rm -f /tmp/pelican_db_password
+    fi
+    
+    if [[ -f /tmp/pma_password ]]; then
+        PMA_PASSWORD=$(cat /tmp/pma_password)
+        rm -f /tmp/pma_password
+    fi
+    
+    if [[ -f /tmp/phpmyadmin_url ]]; then
+        PHPMYADMIN_URL=$(cat /tmp/phpmyadmin_url)
+        rm -f /tmp/phpmyadmin_url
     fi
     
     echo -e "${YELLOW}📋 Database Connection Details:${NC}"
@@ -448,74 +704,28 @@ display_completion() {
     fi
     echo "└─────────────────────────────────────────┘"
     echo ""
+    
+    if [[ -n "$PHPMYADMIN_URL" ]]; then
+        echo -e "${YELLOW}🌐 phpMyAdmin Access:${NC}"
+        echo "┌─────────────────────────────────────────┐"
+        echo "│ URL: http://$PHPMYADMIN_URL              │"
+        echo "│ Username: pma                           │"
+        if [[ -n "$PMA_PASSWORD" ]]; then
+        echo "│ Password: $PMA_PASSWORD                   │"
+        else
+        echo "│ Password: [the one you set]             │"
+        fi
+        echo "└─────────────────────────────────────────┘"
+        echo ""
+    fi
+    
     echo -e "${YELLOW}🚀 Next Steps:${NC}"
     echo "1. Go to your Pelican Admin Panel"
     echo "2. Navigate to Database Hosts"
     echo "3. Click 'Create Database Host'"
     echo "4. Enter the connection details above"
     echo "5. Test the connection"
-    echo ""
-    echo -e "${YELLOW}🔧 Additional Notes:${NC}"
-    echo "• The user 'pelicanuser' has full privileges"
-    echo "• MySQL is configured to accept external connections"
-    echo "• Make sure your network security allows port 3306"
-    echo "• Consider using SSL for production environments"
-    echo ""
-    if [[ -n "$DB_PASSWORD" ]]; then
-        echo -e "${RED}⚠️  SECURITY REMINDER: Save the password above securely!${NC}"
-        echo ""
+    if [[ -n "$PHPMYADMIN_URL" ]]; then
+        echo "6. Access phpMyAdmin at http://$PHPMYADMIN_URL"
     fi
-    echo -e "${GREEN}✨ Made by: Verdanox${NC}"
-}
-
-main() {
-    echo -e "${BLUE}╔═══════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║           PELICAN DATABASE HOST INSTALLATION              ║${NC}"
-    echo -e "${BLUE}╚═══════════════════════════════════════════════════════════╝${NC}"
-    echo -e "${GREEN}Made by: Verdanox${NC}"
     echo ""
-    
-    check_root
-    detect_os
-    
-    print_warning "Installing Pelican Database Host on your server..."
-    print_warning "Operating System: $OS $VERSION"
-    echo ""
-    
-    if [[ -t 0 ]] && [[ -t 1 ]]; then
-        echo -e "${YELLOW}This script will:${NC}"
-        echo "• Install MySQL Server"
-        echo "• Secure the MySQL installation"
-        echo "• Create a database user 'pelicanuser'"
-        echo "• Configure MySQL for external connections"
-        echo "• Set up firewall rules"
-        echo ""
-        
-        read -p "Do you want to continue? (y/N): " -n 1 -r
-        echo ""
-        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-            print_warning "Installation cancelled by user"
-            exit 0
-        fi
-    else
-        print_warning "Running in non-interactive mode (auto-proceeding)"
-        echo -e "${YELLOW}This script will:${NC}"
-        echo "• Install MySQL Server"
-        echo "• Secure the MySQL installation" 
-        echo "• Create a database user 'pelicanuser'"
-        echo "• Configure MySQL for external connections"
-        echo "• Set up firewall rules"
-        echo ""
-        print_status "Starting installation in 3 seconds..."
-        sleep 3
-    fi
-    
-    install_mysql
-    secure_mysql
-    create_database_host
-    allow_external_access
-    setup_firewall
-    display_completion
-}
-
-main "$@"
